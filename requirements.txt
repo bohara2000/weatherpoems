@@ -7,3 +7,6 @@ moviepy
 imageio
 openai
 pyowm
+numpy
+scipy
+git+https://github.com/MTG/freesound-python

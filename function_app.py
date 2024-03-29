@@ -4,6 +4,7 @@ import random
 from pathlib import Path
 import azure.functions as func
 import logging
+import requests
 
 # importing movie py libraries
 import moviepy.editor as mp
@@ -12,9 +13,22 @@ from openai import OpenAI
 from pyowm import OWM
 from pyowm.utils import measurables
 
+# importing audio libraries
+import freesound
+import glob
+
 
 app = func.FunctionApp()
 client = OpenAI()
+
+CHUNK_SIZE = 1024
+url = "https://api.elevenlabs.io/v1/text-to-speech/GBv7mTt0atIp3Br8iCZE"
+
+headers = {
+  "Accept": "audio/mpeg",
+  "Content-Type": "application/json",
+  "xi-api-key": os.environ["ELEVENLABS_API_KEY"]
+}
 
 
 # specify a variable containing a multi=line system prompt for ChatGPT
@@ -76,6 +90,23 @@ def generate_speech_from_text(text, filename):
 
     response.write_to_file(speech_file_path)
 
+def generate_speech_from_text_elevenlabs(text, filename):
+   data = {
+    "text": text,
+    "model_id": "eleven_monolingual_v1",
+    "voice_settings": {
+        "stability": 0.5,
+        "similarity_boost": 0.5
+    }
+    }
+   
+   response = requests.post(url, json=data, headers=headers)
+   with open(filename, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            if chunk:
+                f.write(chunk)
+
+
 
 # define a function that will retrieve weather data from openweathermap API using pyowm based on a city, state, and country
 def get_weather_data(city, state, country):
@@ -94,13 +125,88 @@ def get_weather_data(city, state, country):
         "barometric_pressure": measurables.metric_pressure_dict_to_inhg(
             observation.weather.pressure
         )["press"],
-        "wind_speed": measurables.metric_wind_dict_to_imperial(
+        "wind_speed": round(measurables.metric_wind_dict_to_imperial(
             observation.weather.wind()
-        )["speed"],
+        )["speed"],1),
     }
 
     return response
 
+
+# find a suitable audio clip to use as background audio for the video from the freesound.org API
+def make_bg_audio_clip(duration):
+  # define the parameters for the Freesound API request
+  params = {
+    "token": "YOUR_FREESOUND_API_TOKEN",
+    "duration": duration,
+    "filter": "duration:[0 TO 10]",
+    "fields": "previews",
+    "sort": "random",
+  }
+
+  # make a GET request to the Freesound API
+  response = requests.get("https://freesound.org/apiv2/search/text/", params=params)
+
+  # check if the request was successful
+  if response.status_code == 200:
+    # get the audio preview URL from the response
+    audio_preview_url = response.json()["results"][0]["previews"]["preview-lq-mp3"]
+
+    # download the audio clip and save it to a file
+    audio_clip_response = requests.get(audio_preview_url)
+    audio_clip_path = Path(__file__).parent / "bg_audio_clip.mp3"
+    with open(audio_clip_path, "wb") as audio_file:
+      audio_file.write(audio_clip_response.content)
+
+    # return the audio clip
+    return audio_clip_path
+
+  else:
+    # handle the case when the request fails
+    logging.error("Failed to retrieve audio clip from Freesound API")
+    return None
+  
+
+#searches for and downloads a Freesound.org audio file
+def download_freesound_audio(search_term, duration):
+    # search freeesound.org for the search term
+    client = freesound.FreesoundClient()
+    client.set_token(os.environ['FREESOUND_API_KEY'],"token")
+
+    results = client.text_search(query=search_term,fields="id,name,duration,previews", filter="license:\"Creative Commons 0\"")
+    resultlist = [result for result in results]
+    #print (resultlist[0].duration)
+    
+
+    # pick a random audio file from the search results
+    random_index = random.randint(0, len(resultlist) - 1)
+    audio_file = resultlist[random_index]
+
+
+    # download the audio file
+    audio_file.retrieve_preview('.', audio_file.name)
+    print (audio_file.name)
+    # create a loop of the downloaded audio file until it is the same duration as the video file
+    # get the duration of the downloaded audio file
+    audio_file_duration = audio_file.duration
+
+    # create a new audio file that is the concatenation of the original audio file repeated the number of times calculated above
+    # append mp3 to the end of the audio file name if it is not already there
+    if not audio_file.name.endswith(".mp3"):
+      audio_file.name += ".mp3"
+    newaudio_file = mp.AudioFileClip(audio_file.name)
+    # reduce the volume of the new audio file
+    newaudio_file = newaudio_file.fx(mp.afx.volumex, 0.5)
+
+    audio = mp.afx.audio_loop(newaudio_file, duration=duration)
+    
+    # remove the original audio file
+    os.remove(audio_file.name)
+
+    # return the path to the downloaded audio file
+    return audio
+
+# stretch audio from a video segment 
 
 # Define the main function that will be triggered by the Storage Queue
 # The function takes two parameters: the queue message and the output binding for the blob
@@ -152,7 +258,7 @@ def main(msg: func.QueueMessage, outputBlob: func.Out[str]):
 
     # create another clip containing the weather data in a small box with a gray background at 50% opacity on the top right corner
     weather_clip = mp.TextClip(
-        f"Temperature: {weather_data['temperature']} F\nBarometric Pressure: {weather_data['barometric_pressure']} inHg\nWind Speed: {weather_data['wind_speed']} mph",
+        f"Location: {city}, {state}  {country}\nLat: {weather_data['latitude']}, Lon: {weather_data['longitude']}\nTemperature: {weather_data['temperature']} F\nBarometric Pressure: {weather_data['barometric_pressure']} inHg\nWind Speed: {weather_data['wind_speed']} mph",
         fontsize=24,
         color="white",
         size=(400, 200),
@@ -178,12 +284,14 @@ def main(msg: func.QueueMessage, outputBlob: func.Out[str]):
     text_clips = []
     for i, line in enumerate(lines):
         # Generate speech from text for each line
-        speech_filename = f"speech_{i}.mp3"
-        generate_speech_from_text(line, speech_filename)
+        speech_filename = f"speech_{i}.wav"
+        # generate_speech_from_text(line, speech_filename)
+        generate_speech_from_text_elevenlabs(line, speech_filename)
 
-        # Load the speech clip
+        # Load the speech clip 
         speech_clip = mp.AudioFileClip(speech_filename)
 
+        # AudioEffect.darth_vader(input_file_path, output_filename + '_vader.wav')        
         # Create TextClip for each line of text
         text_clip = TextClip(
             line,
@@ -221,8 +329,17 @@ def main(msg: func.QueueMessage, outputBlob: func.Out[str]):
         .crossfadeout(0.5)
     )
 
-    # Composite the background clip and text clip
-    final_clip = mp.CompositeVideoClip([bg_clip, total_txt_clips, weather_clip])
+    # generate a background audio clip for the video using the make_bg_audio_clip function
+    #bg_audio_clip = make_bg_audio_clip(total_txt_clips.duration)
+    bg_audio_clip = download_freesound_audio("natural-soundscape", total_txt_clips.duration)
+
+    # set the audio for the background clip
+    bg_clip = bg_clip.set_audio(bg_audio_clip)
+
+    # Composite the background clip, text clip, and weather clip
+    final_clip = mp.CompositeVideoClip(
+        [bg_clip, total_txt_clips, weather_clip]
+    )
 
     # save video to blob storage
     final_clip.write_videofile("tmp_vid.mp4", fps=24, codec="libx264")
@@ -239,9 +356,15 @@ def main(msg: func.QueueMessage, outputBlob: func.Out[str]):
         logging.info("temp file removed: tmp_vid.mp4")
         os.remove("tmp_vid.mp4")
 
-    # remove the temporary speech files
-    for i in range(len(lines)):
-        speech_filename = f"speech_{i}.mp3"
-        if os.path.exists(speech_filename):
-            os.remove(speech_filename)
-            logging.info("temp file removed: %s", speech_filename)
+    # remove all .WAV files
+    wav_files = glob.glob("*.wav")
+    for file in wav_files:
+        if os.path.exists(file):
+            os.remove(file)
+            logging.info("temp file removed: %s", file)
+
+    # for i in range(len(lines)):
+    #     speech_filename = f"speech_{i}.wav"
+    #     if os.path.exists(speech_filename):
+    #         os.remove(speech_filename)
+    #         logging.info("temp file removed: %s", speech_filename)
